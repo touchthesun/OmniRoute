@@ -232,6 +232,28 @@ export async function startSwarmLaneTestEnv(
   const app = createServerProcess(dataDir, port, apiKeySecret);
   await waitForServer(app.baseUrl, app);
 
+  // Warm the chat-completions route up with one sequential request before any
+  // concurrent load starts. Next.js dev compiles routes on-demand; several
+  // concurrent first-hits to an uncompiled route were observed to leave every
+  // subsequent request in the run failing (an HTML error page instead of
+  // JSON), not just the first one. One warmup request avoids the race.
+  const warmup = await fetch(`${app.baseUrl}/api/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: SWARM_LANE_COMBO_NAME,
+      stream: false,
+      messages: [{ role: "user", content: "warm up chat route" }],
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!warmup.ok) {
+    throw new Error(`Warmup request failed: HTTP ${warmup.status} ${await warmup.text()}`);
+  }
+  for (const { token } of MOCK_TARGETS) {
+    relay.resetState(token, []);
+  }
+
   return {
     baseUrl: app.baseUrl,
     comboModel: SWARM_LANE_COMBO_NAME,
