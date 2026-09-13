@@ -83,31 +83,54 @@ const NO_AUTH_PROVIDERS: ProviderSpec[] = [
 
 const CONNECTIONLESS_PROVIDERS: ProviderSpec[] = [];
 
-// groq's model id was fixed 2026-09-13: the registry's static
-// llama-3.3-70b-versatile 404'd against a real key (POST
-// /api/providers/[id]/sync-models confirmed it's gone from Groq's live
-// catalog — same "static registry entry can outlive what the provider
-// actually still serves" lesson as aihorde above). openai/gpt-oss-120b was
-// confirmed live and working with a real call.
+// groq's and gemini's model ids were both fixed 2026-09-13 — a static
+// registry entry outliving what the provider actually still serves is
+// evidently common, not a one-off (aihorde had the same issue first):
+// - groq: llama-3.3-70b-versatile 404'd; POST /api/providers/[id]/sync-models
+//   confirmed it's gone from Groq's live catalog. openai/gpt-oss-120b
+//   confirmed live and working.
+// - gemini: gemini-2.5-flash 404'd with Google's own upstream message
+//   naming the fix directly: "no longer available to new users... use
+//   models/gemini-3.6-flash". Confirmed working with a real call.
 const KEYED_PROVIDERS: ProviderSpec[] = [
   { provider: "groq", model: "groq/openai/gpt-oss-120b", envVar: "GROQ_API_KEY" },
-  { provider: "gemini", model: "gemini/gemini-2.5-flash", envVar: "GEMINI_API_KEY" },
+  { provider: "gemini", model: "gemini/gemini-3.6-flash", envVar: "GEMINI_API_KEY" },
   { provider: "mistral", model: "mistral/mistral-small-latest", envVar: "MISTRAL_API_KEY" },
   { provider: "cerebras", model: "cerebras/gpt-oss-120b", envVar: "CEREBRAS_API_KEY" },
   { provider: "openrouter", model: "openrouter/auto", envVar: "OPENROUTER_API_KEY" },
 ];
 
-async function ensureConnection(spec: ProviderSpec, apiKey?: string): Promise<boolean> {
+interface EnsureConnectionResult {
+  created: boolean;
+  /**
+   * Re-testing an already-registered connection is what actually matters
+   * here: a connection can land in a terminal state (e.g. credits_exhausted)
+   * that OmniRoute deliberately does NOT self-heal even after the real
+   * account issue is fixed (AGENTS.md — terminal states need an explicit
+   * reset). Confirmed 2026-09-13: Cerebras returned "No active credentials"
+   * after the operator fixed their account's credits, until POST
+   * /api/providers/[id]/test re-validated the key and cleared the terminal
+   * state. Re-testing on every run makes "I fixed it on the provider's
+   * side" actually take effect the next time this script runs, not just
+   * "I added a brand new key."
+   */
+  valid: boolean | null;
+}
+
+async function ensureConnection(spec: ProviderSpec, apiKey?: string): Promise<EnsureConnectionResult> {
   const existing = await getJson(`/api/providers?provider=${encodeURIComponent(spec.provider)}`);
   if (Array.isArray(existing.connections) && existing.connections.length > 0) {
-    return false; // already registered, nothing to do
+    const id = existing.connections[0].id;
+    const testResult = await postJson(`/api/providers/${id}/test`, {});
+    return { created: false, valid: testResult.valid ?? null };
   }
-  await postJson("/api/providers", {
+  const created = await postJson("/api/providers", {
     provider: spec.provider,
     name: `${spec.provider} (swarm lane)`,
     ...(apiKey ? { apiKey } : {}),
   });
-  return true;
+  const testResult = await postJson(`/api/providers/${created.connection.id}/test`, {});
+  return { created: true, valid: testResult.valid ?? null };
 }
 
 // The server normalizes plain-string model entries into objects on create
@@ -145,14 +168,23 @@ async function ensureCombo(desiredModels: string[]) {
   return { created: false, updated: true, models: desiredModels };
 }
 
+function describeAndInclude(spec: ProviderSpec, result: EnsureConnectionResult, registeredModels: string[]) {
+  const verb = result.created ? "Registered" : "Already registered";
+  if (result.valid === false) {
+    console.log(`${verb}: ${spec.provider} — re-test FAILED, excluding from the combo this run`);
+    return;
+  }
+  console.log(`${verb}: ${spec.provider} (test: ${result.valid === true ? "ok" : "skipped"})`);
+  registeredModels.push(spec.model);
+}
+
 async function main() {
   const registeredModels: string[] = [];
   const missing: string[] = [];
 
   for (const spec of NO_AUTH_PROVIDERS) {
-    const created = await ensureConnection(spec);
-    console.log(`${created ? "Registered" : "Already registered"}: ${spec.provider} (no auth)`);
-    registeredModels.push(spec.model);
+    const result = await ensureConnection(spec);
+    describeAndInclude(spec, result, registeredModels);
   }
 
   for (const spec of CONNECTIONLESS_PROVIDERS) {
@@ -166,9 +198,8 @@ async function main() {
       missing.push(spec.envVar!);
       continue;
     }
-    const created = await ensureConnection(spec, key);
-    console.log(`${created ? "Registered" : "Already registered"}: ${spec.provider}`);
-    registeredModels.push(spec.model);
+    const result = await ensureConnection(spec, key);
+    describeAndInclude(spec, result, registeredModels);
   }
 
   const comboResult = await ensureCombo(registeredModels);

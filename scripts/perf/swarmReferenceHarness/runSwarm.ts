@@ -81,7 +81,15 @@ async function callOnce(comboName: string, task: Task): Promise<CallResult> {
       body: JSON.stringify({
         model: comboName,
         stream: false,
-        max_tokens: 16,
+        // Confirmed 2026-09-13: 16 was too small for real reasoning-heavy
+        // free models (groq/gpt-oss-120b, cerebras/gpt-oss-120b,
+        // gemini-3.6-flash) — they spent the entire budget on hidden
+        // reasoning tokens, returned empty visible content, and OmniRoute's
+        // combo correctly treated that as a failed attempt and moved on to
+        // the next target. That's not a bug — it just meant this harness's
+        // own served-by distribution never reflected those providers
+        // actually working. 200 leaves room for reasoning + a real answer.
+        max_tokens: 200,
         messages: [{ role: "user", content: task.prompt }],
       }),
       signal: AbortSignal.timeout(30_000),
