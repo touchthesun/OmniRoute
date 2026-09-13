@@ -2,11 +2,16 @@
 // against an already-running OmniRoute instance. Idempotent: safe to re-run
 // any time a new provider key becomes available.
 //
-// Usage:
-//   OMNIROUTE_URL=http://localhost:20128 \
-//   OMNIROUTE_API_KEY=<manage-scoped key, only needed if the instance requires login> \
-//   GROQ_API_KEY=... GEMINI_API_KEY=... MISTRAL_API_KEY=... CEREBRAS_API_KEY=... OPENROUTER_API_KEY=... \
-//   node --import tsx/esm scripts/perf/swarmReferenceHarness/registerRealProviders.ts
+// Usage: put GROQ_API_KEY / GEMINI_API_KEY / MISTRAL_API_KEY / CEREBRAS_API_KEY /
+// OPENROUTER_API_KEY (whichever you have) and optionally OMNIROUTE_URL /
+// OMNIROUTE_API_KEY into this worktree's .env, then:
+//   npm run swarm-lane:register-real-providers
+//
+// A plain `node` invocation does NOT read .env on its own (that's Next.js's
+// own loading behavior for the dev server, not something a standalone script
+// gets for free) — the npm script above passes `--env-file=.env` for you. If
+// you invoke this file directly instead, pass that flag yourself:
+//   node --env-file=.env --import tsx/esm scripts/perf/swarmReferenceHarness/registerRealProviders.ts
 
 const BASE_URL = process.env.OMNIROUTE_URL || "http://localhost:20128";
 const API_KEY = process.env.OMNIROUTE_API_KEY || "";
@@ -78,8 +83,14 @@ const NO_AUTH_PROVIDERS: ProviderSpec[] = [
 
 const CONNECTIONLESS_PROVIDERS: ProviderSpec[] = [];
 
+// groq's model id was fixed 2026-09-13: the registry's static
+// llama-3.3-70b-versatile 404'd against a real key (POST
+// /api/providers/[id]/sync-models confirmed it's gone from Groq's live
+// catalog — same "static registry entry can outlive what the provider
+// actually still serves" lesson as aihorde above). openai/gpt-oss-120b was
+// confirmed live and working with a real call.
 const KEYED_PROVIDERS: ProviderSpec[] = [
-  { provider: "groq", model: "groq/llama-3.3-70b-versatile", envVar: "GROQ_API_KEY" },
+  { provider: "groq", model: "groq/openai/gpt-oss-120b", envVar: "GROQ_API_KEY" },
   { provider: "gemini", model: "gemini/gemini-2.5-flash", envVar: "GEMINI_API_KEY" },
   { provider: "mistral", model: "mistral/mistral-small-latest", envVar: "MISTRAL_API_KEY" },
   { provider: "cerebras", model: "cerebras/gpt-oss-120b", envVar: "CEREBRAS_API_KEY" },

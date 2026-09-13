@@ -5,9 +5,10 @@
 // ALL_TARGETS_SKIPPED), the harness pauses that unit of work and retries
 // later, rather than treating it as a hard failure.
 //
-// Usage:
-//   OMNIROUTE_URL=http://localhost:20128 OMNIROUTE_API_KEY=... \
-//   node --import tsx/esm scripts/perf/swarmReferenceHarness/runSwarm.ts --tasks 12 --concurrency 3
+// Usage (put OMNIROUTE_URL / OMNIROUTE_API_KEY in this worktree's .env if needed):
+//   npm run swarm-lane:run-real -- --tasks 12 --concurrency 3
+// A plain `node` invocation does not read .env on its own — pass
+// --env-file=.env yourself if you invoke this file directly instead.
 
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -46,7 +47,8 @@ interface TaskResult {
   status: number;
   latencyMs: number;
   exhaustionRetries: number;
-  servedBy?: string;
+  servedByProvider?: string;
+  servedByModel?: string;
   error?: string;
 }
 
@@ -59,26 +61,43 @@ function buildTasks(count: number): Task[] {
   }));
 }
 
-async function callOnce(comboName: string, task: Task) {
+type CallResult =
+  | { ok: true; status: number; headers: Headers; json: Record<string, unknown>; latencyMs: number }
+  | { ok: false; status: 0; error: string; latencyMs: number };
+
+// Never throws — a timeout or network failure (a real possibility against
+// real free-tier providers, some documented as taking minutes) is reported
+// as a normal failed result, the same as an HTTP error status, rather than
+// crashing the whole run via an unhandled rejection.
+async function callOnce(comboName: string, task: Task): Promise<CallResult> {
   const started = performance.now();
-  const res = await fetch(`${BASE_URL}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {}),
-    },
-    body: JSON.stringify({
-      model: comboName,
-      stream: false,
-      max_tokens: 16,
-      messages: [{ role: "user", content: task.prompt }],
-    }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const latencyMs = Math.round(performance.now() - started);
-  const text = await res.text();
-  const json = text ? JSON.parse(text) : {};
-  return { res, json, latencyMs };
+  try {
+    const res = await fetch(`${BASE_URL}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {}),
+      },
+      body: JSON.stringify({
+        model: comboName,
+        stream: false,
+        max_tokens: 16,
+        messages: [{ role: "user", content: task.prompt }],
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const latencyMs = Math.round(performance.now() - started);
+    const text = await res.text();
+    const json = text ? JSON.parse(text) : {};
+    return { ok: res.ok, status: res.status, headers: res.headers, json, latencyMs };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error instanceof Error ? error.message : String(error),
+      latencyMs: Math.round(performance.now() - started),
+    };
+  }
 }
 
 async function runTask(
@@ -89,22 +108,27 @@ async function runTask(
 ) {
   let exhaustionRetries = 0;
   for (;;) {
-    const { res, json, latencyMs } = await callOnce(comboName, task);
-    if (res.ok) {
-      const content: string | undefined = json?.choices?.[0]?.message?.content;
+    const result = await callOnce(comboName, task);
+
+    if (result.ok) {
+      // Authoritative routing info from OmniRoute's own response headers —
+      // not the response content, which real providers don't echo back
+      // identifiably (that trick only worked against the mock relay, which
+      // we fully controlled).
       onResult({
         taskId: task.id,
         ts: Date.now(),
         ok: true,
-        status: res.status,
-        latencyMs,
+        status: result.status,
+        latencyMs: result.latencyMs,
         exhaustionRetries,
-        servedBy: content,
+        servedByProvider: result.headers.get("x-omniroute-provider") ?? undefined,
+        servedByModel: result.headers.get("x-omniroute-model") ?? undefined,
       });
       return;
     }
 
-    if (res.status === 503 && json?.error?.code === "ALL_TARGETS_SKIPPED") {
+    if (result.status === 503 && result.json?.error?.code === "ALL_TARGETS_SKIPPED") {
       exhaustionRetries += 1;
       console.log(
         `Task ${task.id}: all Swarm Lane targets exhausted, pausing ${exhaustionBackoffMs}ms (retry #${exhaustionRetries})`
@@ -117,10 +141,10 @@ async function runTask(
       taskId: task.id,
       ts: Date.now(),
       ok: false,
-      status: res.status,
-      latencyMs,
+      status: result.status,
+      latencyMs: result.latencyMs,
       exhaustionRetries,
-      error: JSON.stringify(json).slice(0, 300),
+      error: result.status === 0 ? result.error : JSON.stringify(result.json).slice(0, 300),
     });
     return; // a real (non-exhaustion) failure — don't retry forever
   }
@@ -153,12 +177,18 @@ async function main() {
 
   const succeeded = results.filter((r) => r.ok);
   const totalExhaustionRetries = results.reduce((sum, r) => sum + r.exhaustionRetries, 0);
+  const providerCounts = new Map<string, number>();
+  for (const r of succeeded) {
+    const key = r.servedByProvider ?? "unknown";
+    providerCounts.set(key, (providerCounts.get(key) ?? 0) + 1);
+  }
   const summary = [
     `Tasks: ${results.length}  Succeeded: ${succeeded.length} (${(
       (100 * succeeded.length) /
       Math.max(1, results.length)
     ).toFixed(1)}%)`,
     `Total exhaustion pauses across all tasks: ${totalExhaustionRetries}`,
+    `Served-by provider: ${JSON.stringify(Object.fromEntries(providerCounts))}`,
     `Results: ${path.join(runDir, "results.jsonl")}`,
   ].join("\n");
   console.log("\n" + summary);
